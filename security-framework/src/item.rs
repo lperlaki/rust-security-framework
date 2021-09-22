@@ -112,6 +112,7 @@ impl Limit {
     fn to_value(self) -> CFType {
         match self {
             Self::All => unsafe { CFString::wrap_under_get_rule(kSecMatchLimitAll).into_CFType() },
+            Self::Max(1) => unsafe { CFString::wrap_under_get_rule(kSecMatchLimitOne).into_CFType() },
             Self::Max(l) => CFNumber::from(l).into_CFType(),
         }
     }
@@ -143,6 +144,8 @@ pub struct ItemSearchOptions {
     access_group: Option<CFString>,
     pub_key_hash: Option<CFData>,
     app_label: Option<CFData>,
+    service: Option<CFString>,
+    account: Option<CFString>,
 }
 
 #[cfg(target_os = "macos")]
@@ -235,7 +238,22 @@ impl ItemSearchOptions {
     /// Sets `kSecAttrAccessGroup` to `kSecAttrAccessGroupToken`
     #[inline(always)]
     pub fn access_group_token(&mut self) -> &mut Self {
-        self.access_group = unsafe { Some(CFString::wrap_under_get_rule(kSecAttrAccessGroupToken)) };
+        self.access_group =
+            unsafe { Some(CFString::wrap_under_get_rule(kSecAttrAccessGroupToken)) };
+        self
+    }
+
+    /// Sets kSecAttrService
+    #[inline(always)]
+    pub fn service(&mut self, service: &str) -> &mut Self {
+        self.service = Some(CFString::new(service));
+        self
+    }
+
+    /// Sets kSecAttrService
+    #[inline(always)]
+    pub fn account(&mut self, account: &str) -> &mut Self {
+        self.account = Some(CFString::new(account));
         self
     }
 
@@ -351,6 +369,20 @@ impl ItemSearchOptions {
                 ));
             }
 
+            if let Some(ref service) = self.service {
+                params.push((
+                    CFString::wrap_under_get_rule(kSecAttrService),
+                    service.as_CFType(),
+                ));
+            }
+
+            if let Some(ref account) = self.account {
+                params.push((
+                    CFString::wrap_under_get_rule(kSecAttrAccount),
+                    account.as_CFType(),
+                ));
+            }
+
             let params = CFDictionary::from_CFType_pairs(&params);
 
             let mut ret = ptr::null();
@@ -366,9 +398,7 @@ impl ItemSearchOptions {
 
             if type_id == CFArray::<CFType>::type_id() {
                 let array: CFArray<CFType> = CFArray::wrap_under_create_rule(ret as *mut _);
-                for item in array.iter() {
-                    items.push(get_item(item.as_CFTypeRef()));
-                }
+                items.extend(array.into_iter().map(|item| get_item(item.as_CFTypeRef())));
             } else {
                 items.push(get_item(ret));
                 // This is a bit janky, but get_item uses wrap_under_get_rule
@@ -381,41 +411,34 @@ impl ItemSearchOptions {
     }
 }
 
+unsafe fn get_data(item: CFTypeRef) -> Vec<u8> {
+    CFData::wrap_under_get_rule(item as *mut _).bytes().to_vec()
+}
+
 unsafe fn get_item(item: CFTypeRef) -> SearchResult {
-    let type_id = CFGetTypeID(item);
-
-    if type_id == CFData::type_id() {
-        let data = CFData::wrap_under_get_rule(item as *mut _);
-        let mut buf = Vec::new();
-        buf.extend_from_slice(data.bytes());
-        return SearchResult::Data(buf);
-    }
-
-    if type_id == CFDictionary::<*const u8, *const u8>::type_id() {
-        return SearchResult::Dict(CFDictionary::wrap_under_get_rule(item as *mut _));
-    }
-
     #[cfg(target_os = "macos")]
-    {
-        use crate::os::macos::keychain_item::SecKeychainItem;
-        if type_id == SecKeychainItem::type_id() {
-            return SearchResult::Ref(Reference::KeychainItem(
-                SecKeychainItem::wrap_under_get_rule(item as *mut _),
-            ));
+    use crate::os::macos::keychain_item::SecKeychainItem;
+
+    match CFGetTypeID(item) {
+        type_id if type_id == CFData::type_id() => SearchResult::Data(get_data(item)),
+        type_id if type_id == CFDictionary::<*const u8, *const u8>::type_id() => {
+            SearchResult::Dict(CFDictionary::wrap_under_get_rule(item as *mut _))
         }
+        type_id if type_id == SecCertificate::type_id() => SearchResult::Ref(
+            Reference::Certificate(SecCertificate::wrap_under_get_rule(item as *mut _)),
+        ),
+        type_id if type_id == SecKey::type_id() => {
+            SearchResult::Ref(Reference::Key(SecKey::wrap_under_get_rule(item as *mut _)))
+        }
+        type_id if type_id == SecIdentity::type_id() => SearchResult::Ref(Reference::Identity(
+            SecIdentity::wrap_under_get_rule(item as *mut _),
+        )),
+        #[cfg(target_os = "macos")]
+        type_id if type_id == SecKeychainItem::type_id() => SearchResult::Ref(
+            Reference::KeychainItem(SecKeychainItem::wrap_under_get_rule(item as *mut _)),
+        ),
+        type_id => panic!("Got bad type from SecItemCopyMatching: {}", type_id),
     }
-
-    let reference = if type_id == SecCertificate::type_id() {
-        Reference::Certificate(SecCertificate::wrap_under_get_rule(item as *mut _))
-    } else if type_id == SecKey::type_id() {
-        Reference::Key(SecKey::wrap_under_get_rule(item as *mut _))
-    } else if type_id == SecIdentity::type_id() {
-        Reference::Identity(SecIdentity::wrap_under_get_rule(item as *mut _))
-    } else {
-        panic!("Got bad type from SecItemCopyMatching: {}", type_id);
-    };
-
-    SearchResult::Ref(reference)
 }
 
 /// An enum including all objects whose references can be returned from a search.
@@ -423,6 +446,7 @@ unsafe fn get_item(item: CFTypeRef) -> SearchResult {
 /// not have specific object types; they are modeled using dictionaries and so
 /// are available directly as search results in variant `SearchResult::Dict`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Reference {
     /// A `SecIdentity`.
     Identity(SecIdentity),
@@ -507,6 +531,53 @@ impl SearchResult {
                     retmap.insert(format!("{}", keycfstr), val);
                 }
                 Some(retmap)
+            },
+            _ => None,
+        }
+    }
+
+    /// get Data or data field from Dict
+    pub fn get_data(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Data(ref data) => Some(data.to_owned()),
+            Self::Dict(ref dict) => unsafe {
+                dict.find(kSecValueData as *const _).map(|d| get_data(*d))
+            },
+            _ => None,
+        }
+    }
+
+    /// get account attribute
+    pub fn get_attr_account(&self) -> Option<String> {
+        match self {
+            Self::Dict(ref dict) => unsafe {
+                dict.find(kSecAttrAccount as *const _)
+                    .map(|d| CFString::wrap_under_get_rule(*d as *const _))
+                    .map(|s| s.to_string())
+            },
+            _ => None,
+        }
+    }
+
+    /// get service attribute
+    pub fn get_attr_service(&self) -> Option<String> {
+        match self {
+            Self::Dict(ref dict) => unsafe {
+                dict.find(kSecAttrService as *const _)
+                    .map(|d| CFString::wrap_under_get_rule(*d as *const _))
+                    .map(|s| s.to_string())
+            },
+            _ => None,
+        }
+    }
+
+    /// get label attribute
+    pub fn get_attr_label(&self) -> Option<String> {
+        match self {
+            Self::Dict(ref dict) => unsafe {
+                dict.find(kSecAttrLabel as *const _)
+                    .map(|d| CFString::wrap_under_get_rule(*d as *const _))
+                    .map(|s| s.to_string())
             },
             _ => None,
         }
